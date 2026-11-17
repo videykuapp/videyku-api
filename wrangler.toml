@@ -1,0 +1,16 @@
+name = "videyku-api"
+main = "src/index.js"
+compatibility_date = "2026-11-18"
+workers_dev = true
+
+[[r2_buckets]]
+binding = "VIDEOS_BUCKET"
+bucket_name = "videyku-videos"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "videyku-db"
+database_id = "1d8d4658-6213-4567-a9af-86a575bbfd6a"
+
+[triggers]
+crons = ["17 0 * * *"]
