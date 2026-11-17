@@ -1,0 +1,212 @@
+const MAX_FILE_SIZE = 100 * 1024 * 1024;
+const MAX_STORAGE = 300 * 1024 * 1024 * 1024;
+const ALLOWED_TYPES = [
+  "video/mp4",
+  "video/quicktime",
+  "video/webm"
+];
+
+const ALLOWED_ORIGIN = "https://videyku-two.vercel.app";
+
+function response(data, status = 200, origin = ALLOWED_ORIGIN) {
+  return new Response(
+    typeof data === "string" ? data : JSON.stringify(data),
+    {
+      status,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers":
+          "Content-Type, Content-Length, Range, X-Video-Title",
+        "Access-Control-Expose-Headers":
+          "Content-Length, Content-Range, Accept-Ranges",
+      },
+    }
+  );
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const origin = request.headers.get("Origin") || "";
+
+    if (origin && origin !== ALLOWED_ORIGIN) {
+      return response({ error: "Origin tidak diizinkan" }, 403);
+    }
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+          "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
+          "Access-Control-Allow-Headers":
+            "Content-Type, Content-Length, Range, X-Video-Title",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
+    try {
+      if (url.pathname === "/api/upload" && request.method === "POST") {
+        const type = request.headers.get("Content-Type") || "";
+        const size = Number(request.headers.get("Content-Length") || 0);
+
+        if (!ALLOWED_TYPES.includes(type)) {
+          return response({ error: "Format video tidak didukung" }, 415);
+        }
+
+        if (!size || size > MAX_FILE_SIZE) {
+          return response({ error: "Ukuran maksimal 100 MB" }, 413);
+        }
+
+        const id = crypto.randomUUID();
+        const key = `${id}/video`;
+        const title = (
+          request.headers.get("X-Video-Title") || "Video"
+        ).slice(0, 120);
+
+        const reserve = await env.DB.prepare(
+          `UPDATE storage_usage
+           SET used_bytes = used_bytes + ?
+           WHERE id = 1 AND used_bytes + ? <= ?`
+        ).bind(size, size, MAX_STORAGE).run();
+
+        if (reserve.meta.changes !== 1) {
+          return response({ error: "Penyimpanan sedang penuh" }, 507);
+        }
+
+        try {
+          await env.DB.prepare(
+            `INSERT INTO videos
+             (id, title, storage_key, content_type, size_bytes,
+              expires_at, status)
+             VALUES (?, ?, ?, ?, ?, unixepoch() + 2592000, 'pending')`
+          ).bind(id, title, key, type, size).run();
+
+          await env.VIDEOS_BUCKET.put(key, request.body, {
+            httpMetadata: { contentType: type },
+          });
+
+          await env.DB.prepare(
+            "UPDATE videos SET status = 'ready' WHERE id = ?"
+          ).bind(id).run();
+
+          return response({
+            success: true,
+            id,
+            url: `${url.origin}/api/play/${id}`,
+          });
+        } catch (error) {
+          await env.VIDEOS_BUCKET.delete(key).catch(() => {});
+          await env.DB.prepare(
+            "DELETE FROM videos WHERE id = ?"
+          ).bind(id).run();
+          await env.DB.prepare(
+            "UPDATE storage_usage SET used_bytes = MAX(0, used_bytes - ?) WHERE id = 1"
+          ).bind(size).run();
+          throw error;
+        }
+      }
+
+      if (url.pathname.startsWith("/api/video/") &&
+          request.method === "GET") {
+        const id = url.pathname.split("/").pop();
+
+        const video = await env.DB.prepare(
+          `SELECT id, title, content_type, size_bytes
+           FROM videos WHERE id = ? AND status = 'ready'
+           AND expires_at > unixepoch()`
+        ).bind(id).first();
+
+        if (!video) {
+          return response({ error: "Video tidak ditemukan" }, 404);
+        }
+
+        return response({
+          ...video,
+          playback_url: `${url.origin}/api/play/${id}`,
+        });
+      }
+
+      if (url.pathname.startsWith("/api/play/") &&
+          ["GET", "HEAD"].includes(request.method)) {
+        const id = url.pathname.split("/").pop();
+
+        const video = await env.DB.prepare(
+          `SELECT storage_key, content_type
+           FROM videos WHERE id = ? AND status = 'ready'
+           AND expires_at > unixepoch()`
+        ).bind(id).first();
+
+        if (!video) {
+          return new Response("Video tidak ditemukan", { status: 404 });
+        }
+
+        const object = await env.VIDEOS_BUCKET.get(
+          video.storage_key,
+          { range: request.headers }
+        );
+
+        if (!object) {
+          return new Response("Video tidak ditemukan", { status: 404 });
+        }
+
+        const headers = new Headers();
+        object.writeHttpMetadata(headers);
+        headers.set("Content-Type", video.content_type);
+        headers.set("Accept-Ranges", "bytes");
+        headers.set("Cache-Control", "public, max-age=3600");
+
+        let status = 200;
+
+        if (object.range) {
+          const start = object.range.offset ?? 0;
+          const length = object.range.length ?? object.size;
+          headers.set(
+            "Content-Range",
+            `bytes ${start}-${start + length - 1}/${object.size}`
+          );
+          status = 206;
+        }
+
+        headers.set(
+          "Content-Length",
+          String(object.range?.length ?? object.size)
+        );
+
+        return new Response(
+          request.method === "HEAD" ? null : object.body,
+          { status, headers }
+        );
+      }
+
+      return response({ error: "Alamat API tidak ditemukan" }, 404);
+    } catch (error) {
+      return response({ error: "Terjadi kesalahan pada server" }, 500);
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    const expired = await env.DB.prepare(
+      `SELECT id, storage_key, size_bytes
+       FROM videos
+       WHERE expires_at <= unixepoch()
+       AND status IN ('ready', 'pending')
+       LIMIT 100`
+    ).all();
+
+    for (const video of expired.results) {
+      await env.VIDEOS_BUCKET.delete(video.storage_key);
+
+      await env.DB.prepare(
+        "UPDATE videos SET status = 'deleted' WHERE id = ?"
+      ).bind(video.id).run();
+
+      await env.DB.prepare(
+        "UPDATE storage_usage SET used_bytes = MAX(0, used_bytes - ?) WHERE id = 1"
+      ).bind(video.size_bytes).run();
+    }
+  },
+};
