@@ -1,0 +1,8 @@
+{
+  "name": "videyku-api",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
