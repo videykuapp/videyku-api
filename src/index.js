@@ -1,5 +1,4 @@
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
-const MAX_STORAGE = 300 * 1024 * 1024 * 1024;
 const ALLOWED_TYPES = [
   "video/mp4",
   "video/quicktime",
@@ -63,18 +62,14 @@ export default {
 
         const id = crypto.randomUUID();
         const key = `${id}/video`;
-        const title = (
-          request.headers.get("X-Video-Title") || "Video"
-        ).slice(0, 120);
+        const title = "Video";
 
-        const reserve = await env.DB.prepare(
-          `UPDATE storage_usage
-           SET used_bytes = used_bytes + ?
-           WHERE id = 1 AND used_bytes + ? <= ?`
-        ).bind(size, size, MAX_STORAGE).run();
+        const usageUpdate = await env.DB.prepare(
+          "UPDATE storage_usage SET used_bytes = used_bytes + ? WHERE id = 1"
+        ).bind(size).run();
 
-        if (reserve.meta.changes !== 1) {
-          return response({ error: "Penyimpanan sedang penuh" }, 507);
+        if (usageUpdate.meta.changes !== 1) {
+          return response({ error: "Pencatatan kapasitas gagal. Silakan coba lagi." }, 500);
         }
 
         try {
@@ -190,23 +185,42 @@ export default {
 
   async scheduled(event, env, ctx) {
     const expired = await env.DB.prepare(
-      `SELECT id, storage_key, size_bytes
+      `SELECT id, storage_key
        FROM videos
        WHERE expires_at <= unixepoch()
        AND status IN ('ready', 'pending')
-       LIMIT 100`
+       ORDER BY expires_at ASC
+       LIMIT 1000`
     ).all();
 
-    for (const video of expired.results) {
-      await env.VIDEOS_BUCKET.delete(video.storage_key);
+    const batchSize = 25;
+    for (let i = 0; i < expired.results.length; i += batchSize) {
+      const batch = expired.results.slice(i, i + batchSize);
 
-      await env.DB.prepare(
-        "UPDATE videos SET status = 'deleted' WHERE id = ?"
-      ).bind(video.id).run();
+      await Promise.all(batch.map(async video => {
+        try {
+          await env.VIDEOS_BUCKET.delete(video.storage_key);
 
-      await env.DB.prepare(
-        "UPDATE storage_usage SET used_bytes = MAX(0, used_bytes - ?) WHERE id = 1"
-      ).bind(video.size_bytes).run();
+          await env.DB.batch([
+            env.DB.prepare(
+              `UPDATE storage_usage
+               SET used_bytes = MAX(0, used_bytes - (
+                 SELECT CASE
+                   WHEN status IN ('ready', 'pending') THEN size_bytes
+                   ELSE 0
+                 END
+                 FROM videos WHERE id = ?
+               ))
+               WHERE id = 1`
+            ).bind(video.id),
+            env.DB.prepare(
+              "UPDATE videos SET status = 'deleted' WHERE id = ? AND status IN ('ready', 'pending')"
+            ).bind(video.id)
+          ]);
+        } catch (error) {
+          console.error("Gagal menghapus video kedaluwarsa:", video.id, error);
+        }
+      }));
     }
   },
 };
