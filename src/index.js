@@ -5,9 +5,13 @@ const ALLOWED_TYPES = [
   "video/webm"
 ];
 
-const ALLOWED_ORIGIN = "https://videyku-two.vercel.app";
+const DEFAULT_ORIGIN = "https://videyku-two.vercel.app";
+const ALLOWED_ORIGINS = [
+  "https://videyku-two.vercel.app",
+  "https://videyku-5rl.pages.dev",
+];
 
-function response(data, status = 200, origin = ALLOWED_ORIGIN) {
+function response(data, status = 200, origin = DEFAULT_ORIGIN) {
   return new Response(
     typeof data === "string" ? data : JSON.stringify(data),
     {
@@ -29,16 +33,18 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const origin = request.headers.get("Origin") || "";
+    const corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : DEFAULT_ORIGIN;
+    const respond = (data, status = 200) => response(data, status, corsOrigin);
 
-    if (origin && origin !== ALLOWED_ORIGIN) {
-      return response({ error: "Origin tidak diizinkan" }, 403);
+    if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+      return respond({ error: "Origin tidak diizinkan" }, 403);
     }
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
-          "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+          "Access-Control-Allow-Origin": corsOrigin,
           "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
           "Access-Control-Allow-Headers":
             "Content-Type, Content-Length, Range, X-Video-Title",
@@ -53,11 +59,11 @@ export default {
         const size = Number(request.headers.get("Content-Length") || 0);
 
         if (!ALLOWED_TYPES.includes(type)) {
-          return response({ error: "Format video tidak didukung" }, 415);
+          return respond({ error: "Format video tidak didukung" }, 415);
         }
 
         if (!size || size > MAX_FILE_SIZE) {
-          return response({ error: "Ukuran maksimal 100 MB" }, 413);
+          return respond({ error: "Ukuran maksimal 100 MB" }, 413);
         }
 
         const id = crypto.randomUUID();
@@ -69,7 +75,7 @@ export default {
         ).bind(size).run();
 
         if (usageUpdate.meta.changes !== 1) {
-          return response({ error: "Pencatatan kapasitas gagal. Silakan coba lagi." }, 500);
+          return respond({ error: "Pencatatan kapasitas gagal. Silakan coba lagi." }, 500);
         }
 
         try {
@@ -88,7 +94,7 @@ export default {
             "UPDATE videos SET status = 'ready' WHERE id = ?"
           ).bind(id).run();
 
-          return response({
+          return respond({
             success: true,
             id,
             url: `${url.origin}/api/play/${id}`,
@@ -116,10 +122,10 @@ export default {
         ).bind(id).first();
 
         if (!video) {
-          return response({ error: "Video tidak ditemukan" }, 404);
+          return respond({ error: "Video tidak ditemukan" }, 404);
         }
 
-        return response({
+        return respond({
           ...video,
           playback_url: `${url.origin}/api/play/${id}`,
         });
@@ -177,9 +183,9 @@ export default {
         );
       }
 
-      return response({ error: "Alamat API tidak ditemukan" }, 404);
+      return respond({ error: "Alamat API tidak ditemukan" }, 404);
     } catch (error) {
-      return response({ error: "Terjadi kesalahan pada server" }, 500);
+      return respond({ error: "Terjadi kesalahan pada server" }, 500);
     }
   },
 
